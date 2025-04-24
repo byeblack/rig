@@ -186,42 +186,39 @@ impl<T: Tool> ToolDyn for T {
 }
 
 #[cfg(feature = "mcp")]
-pub struct McpTool<T: mcp_core::transport::Transport> {
-    definition: mcp_core::types::Tool,
-    client: mcp_core::client::Client<T>,
+pub struct McpTool {
+    definition: rmcp::model::Tool,
+    client: rmcp::service::ServerSink,
 }
 
 #[cfg(feature = "mcp")]
-impl<T> McpTool<T>
-where
-    T: mcp_core::transport::Transport,
-{
+impl McpTool {
     pub fn from_mcp_server(
-        definition: mcp_core::types::Tool,
-        client: mcp_core::client::Client<T>,
+        definition: rmcp::model::Tool,
+        client: rmcp::service::ServerSink,
     ) -> Self {
         Self { definition, client }
     }
 }
 
 #[cfg(feature = "mcp")]
-impl From<&mcp_core::types::Tool> for ToolDefinition {
-    fn from(val: &mcp_core::types::Tool) -> Self {
+impl From<&rmcp::model::Tool> for ToolDefinition {
+    fn from(val: &rmcp::model::Tool) -> Self {
         Self {
-            name: val.name.to_owned(),
-            description: val.description.to_owned().unwrap_or_default(),
-            parameters: val.input_schema.to_owned(),
+            name: val.name.to_string(),
+            description: val.description.to_string(),
+            parameters: val.schema_as_json_value(),
         }
     }
 }
 
 #[cfg(feature = "mcp")]
-impl From<mcp_core::types::Tool> for ToolDefinition {
-    fn from(val: mcp_core::types::Tool) -> Self {
+impl From<rmcp::model::Tool> for ToolDefinition {
+    fn from(val: rmcp::model::Tool) -> Self {
         Self {
-            name: val.name,
-            description: val.description.unwrap_or_default(),
-            parameters: val.input_schema,
+            name: val.name.to_string(),
+            description: val.description.to_string(),
+            parameters: val.schema_as_json_value(),
         }
     }
 }
@@ -239,12 +236,9 @@ impl From<McpToolError> for ToolError {
 }
 
 #[cfg(feature = "mcp")]
-impl<T> ToolDyn for McpTool<T>
-where
-    T: mcp_core::transport::Transport,
-{
+impl ToolDyn for McpTool {
     fn name(&self) -> String {
-        self.definition.name.clone()
+        self.definition.name.to_string()
     }
 
     fn definition(
@@ -253,11 +247,8 @@ where
     ) -> Pin<Box<dyn Future<Output = ToolDefinition> + Send + Sync + '_>> {
         Box::pin(async move {
             ToolDefinition {
-                name: self.definition.name.clone(),
-                description: match &self.definition.description {
-                    Some(desc) => desc.clone(),
-                    None => String::new(),
-                },
+                name: self.definition.name.to_string(),
+                description: self.definition.description.to_string(),
                 parameters: serde_json::to_value(&self.definition.input_schema).unwrap_or_default(),
             }
         })
@@ -268,47 +259,63 @@ where
         args: String,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + Sync + '_>> {
         let name = self.definition.name.clone();
-        let args_clone = args.clone();
-        let args: serde_json::Value = serde_json::from_str(&args_clone).unwrap_or_default();
+        let arguments = serde_json::from_str(&args).unwrap_or_default();
+
         Box::pin(async move {
             let result = self
                 .client
-                .call_tool(&name, Some(args))
+                .call_tool(rmcp::model::CallToolRequestParam { name, arguments })
                 .await
                 .map_err(|e| McpToolError(format!("Tool returned an error: {}", e)))?;
 
             if result.is_error.unwrap_or(false) {
                 if let Some(error) = result.content.first() {
-                    match error {
-                        mcp_core::types::ToolResponseContent::Text { text } => {
-                            return Err(McpToolError(text.clone()).into());
-                        }
-                        _ => return Err(McpToolError("Unsuppported error type".to_string()).into()),
+                    if let Some(raw) = error.as_text() {
+                        return Err(McpToolError(raw.text.clone()).into());
+                    } else {
+                        return Err(McpToolError("Unsuppported error type".to_string()).into());
                     }
                 } else {
                     return Err(McpToolError("No error message returned".to_string()).into());
                 }
-            }
+            };
 
             Ok(result
                 .content
                 .into_iter()
-                .map(|c| match c {
-                    mcp_core::types::ToolResponseContent::Text { text } => text,
-                    mcp_core::types::ToolResponseContent::Image { data, mime_type } => {
-                        format!("data:{};base64,{}", mime_type, data)
+                .map(|c| match c.raw {
+                    rmcp::model::RawContent::Text(raw) => raw.text,
+                    rmcp::model::RawContent::Image(raw) => {
+                        format!("data:{};base64,{}", raw.mime_type, raw.data)
                     }
-                    mcp_core::types::ToolResponseContent::Resource {
-                        resource: mcp_core::types::ResourceContents { uri, mime_type },
-                    } => {
-                        format!(
-                            "{}{}",
+                    rmcp::model::RawContent::Resource(raw) => match raw.resource {
+                        rmcp::model::ResourceContents::TextResourceContents {
+                            uri,
+                            mime_type,
+                            text,
+                        } => {
+                            format!(
+                                "{}{}:{}",
+                                mime_type
+                                    .map(|m| format!("data:{};", m))
+                                    .unwrap_or_default(),
+                                uri,
+                                text
+                            )
+                        }
+                        rmcp::model::ResourceContents::BlobResourceContents {
+                            uri,
+                            mime_type,
+                            blob,
+                        } => format!(
+                            "{}{}:{}",
                             mime_type
                                 .map(|m| format!("data:{};", m))
                                 .unwrap_or_default(),
-                            uri
-                        )
-                    }
+                            uri,
+                            blob
+                        ),
+                    },
                 })
                 .collect::<Vec<_>>()
                 .join(""))
