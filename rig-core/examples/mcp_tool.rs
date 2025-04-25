@@ -1,83 +1,74 @@
 use anyhow::Result;
-use mcp_core::{
-    client::ClientBuilder,
-    server::Server,
-    tool_text_content,
-    transport::{ClientSseTransportBuilder, ServerSseTransport},
-    types::{ClientCapabilities, Implementation, ServerCapabilities, ToolResponseContent},
-};
-use mcp_core_macros::tool;
 use rig::{
     completion::Prompt,
     providers::{self},
 };
-use serde_json::json;
+use rmcp::{
+    model::{CallToolResult, Content},
+    tool,
+    transport::{SseServer, SseTransport},
+    Error as McpError, ServerHandler, ServiceExt,
+};
 
-#[tool(
-    name = "Add",
-    description = "Adds two numbers together.",
-    params(a = "The first number to add", b = "The second number to add")
-)]
-async fn add_tool(a: f64, b: f64) -> Result<ToolResponseContent> {
-    Ok(tool_text_content!((a + b).to_string()))
+#[derive(Clone)]
+struct McpController;
+
+#[tool(tool_box)]
+impl McpController {
+    #[tool(name = "Add", description = "Adds two numbers together.")]
+    async fn add_tool(
+        #[tool(param)]
+        #[schemars(description = "The first number to add")]
+        a: f64,
+        #[tool(param)]
+        #[schemars(description = "The second number to add")]
+        b: f64,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(CallToolResult::success(vec![Content::text(
+            (a + b).to_string(),
+        )]))
+    }
 }
+
+#[tool(tool_box)]
+impl ServerHandler for McpController {}
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt().init();
 
     // Create the MCP server
-    let mcp_server_protocol = Server::builder("add".to_string(), "1.0".to_string())
-        .capabilities(ServerCapabilities {
-            tools: Some(json!({
-                "listChanged": false,
-            })),
-            ..Default::default()
-        })
-        .register_tool(AddTool::tool(), AddTool::call())
-        .build();
-    let mcp_server_transport =
-        ServerSseTransport::new("127.0.0.1".to_string(), 3000, mcp_server_protocol);
-    tokio::spawn(async move { Server::start(mcp_server_transport).await });
+    let serve_ct = SseServer::serve("127.0.0.1:3000".parse()?)
+        .await?
+        .with_service(|| McpController);
 
     // Create the MCP client
-    let mcp_client = ClientBuilder::new(
-        ClientSseTransportBuilder::new("http://127.0.0.1:3000/sse".to_string()).build(),
-    )
-    .build();
-    // Start the MCP client
-    mcp_client.open().await?;
+    let transport = SseTransport::start("http://127.0.0.1:3000/sse").await?;
+    let mcp_client = None.serve(transport).await?;
 
-    let init_res = mcp_client
-        .initialize(
-            Implementation {
-                name: "mcp-client".to_string(),
-                version: "0.1.0".to_string(),
-            },
-            ClientCapabilities::default(),
-        )
-        .await?;
-    println!("Initialized: {:?}", init_res);
-
-    let tools_list_res = mcp_client.list_tools(None, None).await?;
+    let tools_list_res = mcp_client.list_all_tools().await?;
     println!("Tools: {:?}", tools_list_res);
 
     tracing::info!("Building RIG agent");
-    let completion_model = providers::openai::Client::from_env();
-    let mut agent_builder = completion_model.agent("gpt-4o");
+    let completion_model = providers::ollama::Client::new();
+    let mut agent_builder = completion_model.agent("qwen2.5:14b");
+
+    // let completion_model = providers::openai::Client::from_env();
+    // let mut agent_builder = completion_model.agent("gpt-4o");
 
     // Add MCP tools to the agent
     agent_builder = tools_list_res
-        .tools
         .into_iter()
         .fold(agent_builder, |builder, tool| {
-            builder.mcp_tool(tool, mcp_client.clone().into())
+            builder.mcp_tool(tool, mcp_client.clone())
         });
     let agent = agent_builder.build();
 
     tracing::info!("Prompting RIG agent");
     let response = agent.prompt("Add 10 + 10").await?;
     tracing::info!("Agent response: {:?}", response);
+
+    serve_ct.cancel();
 
     Ok(())
 }

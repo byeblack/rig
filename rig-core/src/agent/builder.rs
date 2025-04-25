@@ -107,14 +107,10 @@ impl<M: CompletionModel> AgentBuilder<M> {
 
     // Add an MCP tool to the agent
     #[cfg(feature = "mcp")]
-    pub fn mcp_tool<T: mcp_core::transport::Transport>(
-        mut self,
-        tool: mcp_core::types::Tool,
-        client: mcp_core::client::Client<T>,
-    ) -> Self {
+    pub fn mcp_tool(mut self, tool: rmcp::model::Tool, client: rmcp::service::ServerSink) -> Self {
         let toolname = tool.name.clone();
         self.tools.add_tool(McpTool::from_mcp_server(tool, client));
-        self.static_tools.push(toolname);
+        self.static_tools.push(toolname.to_string());
         self
     }
 
