@@ -109,8 +109,10 @@
 
 mod builder;
 mod completion;
+mod dynamic_info;
 mod prompt_request;
 
 pub use builder::AgentBuilder;
 pub use completion::Agent;
+pub use dynamic_info::ComputingDynamicInfo;
 pub use prompt_request::PromptRequest;
