@@ -4,29 +4,38 @@ use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::{
     completion::{CompletionError, CompletionModel, Document, ToolDefinition},
+    message::Message,
     vector_store::VectorStoreError,
 };
 
 use super::Agent;
 
 pub trait ComputingDynamicInfo<M: CompletionModel> {
-    fn context(
+    fn computing_context(
         &self,
-        text: &str,
+        prompt: impl Into<Message> + Send,
     ) -> impl std::future::Future<Output = Result<Vec<Document>, CompletionError>> + Send;
-    fn tools(
+    fn computing_tools(
         &self,
-        text: &str,
+        prompt: impl Into<Message> + Send,
     ) -> impl std::future::Future<Output = Result<Vec<ToolDefinition>, CompletionError>> + Send;
 }
 
 impl<M: CompletionModel> ComputingDynamicInfo<M> for Agent<M> {
-    async fn context(&self, text: &str) -> Result<Vec<Document>, CompletionError> {
+    async fn computing_context(
+        &self,
+        prompt: impl Into<Message> + Send,
+    ) -> Result<Vec<Document>, CompletionError> {
+        let prompt: Message = prompt.into();
+        let Some(text) = prompt.rag_text() else {
+            return Err(CompletionError::RequestError("Invalid prompt".into()));
+        };
+
         let dynamic_context = stream::iter(self.dynamic_context.iter())
             .then(|(num_sample, index)| async {
                 Ok::<_, VectorStoreError>(
                     index
-                        .top_n(text, *num_sample)
+                        .top_n(&text, *num_sample)
                         .await?
                         .into_iter()
                         .map(|(_, id, doc)| {
@@ -53,7 +62,15 @@ impl<M: CompletionModel> ComputingDynamicInfo<M> for Agent<M> {
         Ok(dynamic_context)
     }
 
-    async fn tools(&self, text: &str) -> Result<Vec<ToolDefinition>, CompletionError> {
+    async fn computing_tools(
+        &self,
+        prompt: impl Into<Message> + Send,
+    ) -> Result<Vec<ToolDefinition>, CompletionError> {
+        let prompt: Message = prompt.into();
+        let Some(text) = &prompt.rag_text() else {
+            return Err(CompletionError::RequestError("Invalid prompt".into()));
+        };
+
         let static_tools = stream::iter(self.static_tools.iter())
             .filter_map(|toolname| async move {
                 if let Some(tool) = self.tools.get(toolname) {
